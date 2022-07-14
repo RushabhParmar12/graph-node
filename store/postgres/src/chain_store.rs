@@ -69,6 +69,7 @@ mod data {
     use graph::prelude::{
         serde_json as json, BlockNumber, BlockPtr, CachedEthereumCall, Error, StoreError,
     };
+    use serde::Deserialize;
     use std::fmt;
     use std::iter::FromIterator;
     use std::{convert::TryFrom, io::Write};
@@ -593,30 +594,54 @@ mod data {
             &self,
             conn: &PgConnection,
             hash: &BlockHash,
-        ) -> Result<Option<BlockNumber>, StoreError> {
+        ) -> Result<Option<(BlockNumber, Option<String>)>, StoreError> {
+            #[derive(Deserialize)]
+            struct Block {
+                timestamp: String,
+            }
+            #[derive(Deserialize)]
+            struct Data {
+                block: Block,
+            }
+
             let number = match self {
                 Storage::Shared => {
                     use public::ethereum_blocks as b;
 
                     b::table
-                        .select(b::number)
+                        .select((b::number, b::data))
                         .filter(b::hash.eq(format!("{:x}", hash)))
-                        .first::<i64>(conn)
+                        .first::<(i64, json::Value)>(conn)
                         .optional()?
                 }
                 Storage::Private(Schema { blocks, .. }) => blocks
                     .table()
-                    .select(blocks.number())
+                    .select((blocks.number(), blocks.data()))
                     .filter(blocks.hash().eq(hash.as_slice()))
-                    .first::<i64>(conn)
+                    .first::<(i64, json::Value)>(conn)
                     .optional()?,
             };
-            number
-                .map(|number| {
-                    BlockNumber::try_from(number)
-                        .map_err(|e| StoreError::QueryExecutionError(e.to_string()))
-                })
-                .transpose()
+
+            match number {
+                None => Ok(None),
+                Some((number, json)) => {
+                    let number = BlockNumber::try_from(number)
+                        .map_err(|e| StoreError::QueryExecutionError(e.to_string()))?;
+
+                    match json {
+                        obj @ json::Value::Object(_) => {
+                            let x: Option<Data> = json::from_value(obj).ok();
+                            return Ok(Some((
+                                number,
+                                x.map(|obj| obj.block.timestamp).map(Into::into),
+                            )));
+                        }
+                        _ => {}
+                    }
+
+                    Ok(Some((number, None)))
+                }
+            }
         }
 
         /// Find the first block that is missing from the database needed to
@@ -1687,12 +1712,15 @@ impl ChainStoreTrait for ChainStore {
             .confirm_block_hash(&conn, &self.chain, number, hash)
     }
 
-    fn block_number(&self, hash: &BlockHash) -> Result<Option<(String, BlockNumber)>, StoreError> {
+    fn block_number(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Option<(String, BlockNumber, Option<String>)>, StoreError> {
         let conn = self.get_conn()?;
         Ok(self
             .storage
             .block_number(&conn, hash)?
-            .map(|number| (self.chain.clone(), number)))
+            .map(|(number, timestamp)| (self.chain.clone(), number, timestamp)))
     }
 
     async fn transaction_receipts_in_block(
